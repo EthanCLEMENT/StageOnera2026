@@ -5344,33 +5344,15 @@ def _signed_frequency_grid(wmin=1e-3, wmax=5e1, npos=160):
 
 def _gain_curve_for_theta(cl_dyn, theta, ws):
     """
-    Compute gain curve for a closed-loop controller theta.
-    This is the expensive part, so keep ws modest.
+    Correct dynamic-controller objective:
+    physical q->q gain, same quantity used by PyGRANSO.
     """
-    Acl = cl_dyn.Acl(theta)
-    Ecl = cl_dyn.Ecl()
+    vals = []
+    for w in ws:
+        vals.append(float(cl_dyn.gain_of_omega(theta, float(w))))
+    return np.asarray(vals, dtype=float)
 
-    tasks = [float(w) for w in ws]
-
-    def _one(w):
-        return w, float(gain_of_omega(Acl, Ecl, w))
-
-    if "mpi_task_map" in globals():
-        pairs = mpi_task_map(
-            _one,
-            tasks,
-            label="flattening_gain_curve",
-            use_parallel=True,
-        )
-    else:
-        pairs = [_one(w) for w in tasks]
-
-    pairs = sorted(pairs, key=lambda p: p[0])
-    return (
-        np.array([p[0] for p in pairs], dtype=float),
-        np.array([p[1] for p in pairs], dtype=float),
-    )
-
+    return np.asarray(vals, dtype=float)
 
 def plot_frequency_response_flattening_over_iterations(
     outdir="/stck/eclement/Control Of NavierStokes/plots",
@@ -5937,13 +5919,13 @@ def _make_cldyn_for_best(best, r=4):
 
 
 def _gain_curve_for_theta(cl_dyn, theta, ws):
-    Acl = cl_dyn.Acl(theta)
-    Ecl = cl_dyn.Ecl()
-
+    """
+    Correct dynamic-controller objective:
+    physical q->q gain, same quantity used by PyGRANSO.
+    """
     vals = []
     for w in ws:
-        vals.append(float(gain_of_omega(Acl, Ecl, float(w))))
-
+        vals.append(float(cl_dyn.gain_of_omega(theta, float(w))))
     return np.asarray(vals, dtype=float)
 
 
@@ -6041,20 +6023,25 @@ def plot_controller_gain_curve_flattening(
 
     finite_ws = np.asarray(ws, dtype=float)
 
+    mask = (finite_ws >= -0.7) & (finite_ws <= -0.3)
+
+    finite_ws_plot = finite_ws[mask]
+
     nz = np.abs(finite_ws[np.abs(finite_ws) > 0.0])
     linthresh = max(float(np.min(nz)) if nz.size else 1e-6, 1e-12)
 
     fig, ax = plt.subplots(figsize=(10.8, 5.9))
 
     for j, c in enumerate(curves):
-        vals = c["vals"]
         lw = 1.0 + 1.3 * j / max(1, len(curves) - 1)
         alpha = 0.45 + 0.50 * j / max(1, len(curves) - 1)
-        ax.plot(finite_ws, vals, linewidth=lw, alpha=alpha, label=c["label"])
 
-        kmax = int(np.nanargmax(vals))
-        ax.scatter([finite_ws[kmax]], [vals[kmax]], s=35, zorder=5)
+        vals = np.asarray(c["vals"], dtype=float)[mask]
 
+        ax.plot(finite_ws_plot, vals, linewidth=lw, alpha=alpha, label=c["label"])
+
+    kmax = int(np.nanargmax(vals))
+    ax.scatter([finite_ws_plot[kmax]], [vals[kmax]], s=35, zorder=5)
     ax.set_xscale("symlog", linthresh=linthresh)
     ax.set_yscale("log")
     ax.set_xlabel(r"frequency $\omega$")
@@ -6105,3 +6092,1066 @@ if 1 ==1:
     if _extra_is_root():
         print("Flattening plot mode:", flattening_report["mode"], flush=True)
         print("Flattening plot:", flattening_paths, flush=True)
+
+# =============================================================================
+# Manual best dynamic controller from HINF-only dynamic placement run
+#
+# This overrides the previous "load from txt/global-best file" behavior.
+# It uses the exact controller law pasted from the run output:
+#
+#   xa = -1.2534377484
+#   xs = +1.1747285945
+#   K  = +1.6624761149e-23
+#
+#   a, n complex vectors as printed by the optimization.
+#
+# Use:
+#   RUN_TRUE_MULTISTART=0 MAKE_MANUAL_CONTROLLER_ALL_PLOTS=1 python plot.py
+# =============================================================================
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+MANUAL_DYNAMIC_CONTROLLER = {
+    "xa": -1.2534377484,
+    "xs": +1.1747285945,
+    "K": +1.6624761149e-23,
+    "omega_star": -4.953815e-01,
+    "hinf": 7.5271409543e+01,
+    "alpha": -2.3636495538e-01,
+
+    "a": np.array([
+        -546.80526825 + 2514.16891543j,
+        4408.26797897 + 8994.22589582j,
+        15603.0622968 + 1095.36054549j,
+        2147.09583755 - 698.34854914j,
+    ], dtype=np.complex128),
+
+    "n": np.array([
+        -47012.90839624 + 30316.9848265j,
+        -214398.86653607 + 65805.23848916j,
+        -127140.38200229 - 78081.94762484j,
+        -46568.22443389 + 6344.07992002j,
+    ], dtype=np.complex128),
+
+    "source": "manual pasted HINF-only dynamic placement controller",
+}
+
+
+def _manual_is_root():
+    return ("IS_WORLD_ROOT" not in globals()) or bool(IS_WORLD_ROOT)
+
+
+def _manual_barrier():
+    if "WORLD" in globals():
+        WORLD.Barrier()
+
+
+def _manual_env_flag(name, default=False):
+    if "_env_flag" in globals():
+        return _env_flag(name, default)
+    val = os.environ.get(name)
+    if val is None:
+        return bool(default)
+    return str(val).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _manual_mkdir(outdir):
+    if _manual_is_root():
+        os.makedirs(outdir, exist_ok=True)
+    _manual_barrier()
+
+
+def _manual_savefig(fig, outdir, basename):
+    _manual_mkdir(outdir)
+    if not _manual_is_root():
+        return None
+
+    png = os.path.join(outdir, f"{basename}.png")
+    pdf = os.path.join(outdir, f"{basename}.pdf")
+
+    fig.savefig(png, dpi=250, bbox_inches="tight")
+    fig.savefig(pdf, bbox_inches="tight")
+    plt.close(fig)
+
+    return {"png": png, "pdf": pdf}
+
+
+# -----------------------------------------------------------------------------
+# Override the previous loader.
+# The old function name is kept so the earlier plotting functions use this
+# pasted controller automatically.
+# -----------------------------------------------------------------------------
+
+def load_best_noK_controller(txt_name=None, r=4):
+    best = dict(MANUAL_DYNAMIC_CONTROLLER)
+    best["a"] = np.asarray(best["a"], dtype=np.complex128).reshape(r)
+    best["n"] = np.asarray(best["n"], dtype=np.complex128).reshape(r)
+    return best
+
+
+def make_manual_cldyn(r=4):
+    best = load_best_noK_controller(r=r)
+    return make_cldyn_for_placement(
+        xa=float(best["xa"]),
+        xs=float(best["xs"]),
+        A=A,
+        M=M,
+        V=V,
+        phi=phi,
+        bc=bc,
+        is_free=is_free,
+        sigma_gauss=sigma_gauss,
+        r=r,
+    )
+
+
+def manual_theta(best=None, r=4):
+    if best is None:
+        best = load_best_noK_controller(r=r)
+
+    cl_dyn = make_manual_cldyn(r=r)
+
+    theta = cl_dyn.pack_theta(
+        np.asarray(best["a"], dtype=np.complex128).reshape(r),
+        np.asarray(best["n"], dtype=np.complex128).reshape(r),
+        Kstat=float(best["K"]),
+    )
+
+    return cl_dyn, theta
+
+
+# Override these names too, because previous optional slice/flattening helpers use them.
+def _make_cldyn_for_best(best, r=4):
+    return make_cldyn_for_placement(
+        xa=float(best["xa"]),
+        xs=float(best["xs"]),
+        A=A,
+        M=M,
+        V=V,
+        phi=phi,
+        bc=bc,
+        is_free=is_free,
+        sigma_gauss=sigma_gauss,
+        r=r,
+    )
+
+
+def _make_best_cldyn_for_slice(r=4):
+    return make_manual_cldyn(r=r)
+
+
+def _get_best_run_object():
+    """
+    We only have the final pasted controller, not the full in-memory PyGRANSO
+    history. This makes older slice helpers fall back safely.
+    """
+    return None, None, None
+
+
+def _manual_signed_log_grid(wmin=1e-3, wmax=5e1, npos=90):
+    wp = np.logspace(np.log10(float(wmin)), np.log10(float(wmax)), int(npos))
+    return np.concatenate((-wp[::-1], [0.0], wp))
+
+
+def _manual_gain_curve_open(A, M, ws):
+    vals = []
+    for w in ws:
+        vals.append(float(gain_of_omega(A, M, float(w))))
+    return np.asarray(vals, dtype=float)
+
+
+def _manual_gain_curve_dynamic_physical(cl_dyn, theta, ws):
+    """
+    Correct dynamic closed-loop gain.
+
+    This uses the physical q->q map:
+        cl_dyn.gain_of_omega(theta, omega)
+
+    Do NOT replace this with gain_of_omega(Acl, Ecl, omega),
+    because that computes the augmented plant+controller resolvent.
+    """
+    vals = []
+    for w in ws:
+        vals.append(float(cl_dyn.gain_of_omega(theta, float(w))))
+    return np.asarray(vals, dtype=float)
+
+
+def plot_manual_open_vs_controlled_gain_corrected(
+    outdir="/stck/eclement/Control Of NavierStokes/plots",
+    basename="21_manual_open_vs_controlled_gain_corrected",
+    wmin=1e-3,
+    wmax=5e1,
+    npos=90,
+):
+    best = load_best_noK_controller(r=4)
+    cl_dyn, theta = manual_theta(best, r=4)
+
+    ws = _manual_signed_log_grid(wmin=wmin, wmax=wmax, npos=npos)
+
+    # Open-loop physical q->q map
+    open_gain = _manual_gain_curve_open(A, M, ws)
+
+    # Correct closed-loop physical q->q map
+    closed_gain = _manual_gain_curve_dynamic_physical(cl_dyn, theta, ws)
+
+    _manual_mkdir(outdir)
+    if not _manual_is_root():
+        return None
+
+    nz = np.abs(ws[np.abs(ws) > 0.0])
+    linthresh = max(float(np.min(nz)), 1e-12)
+
+    j_open = int(np.nanargmax(open_gain))
+    j_closed = int(np.nanargmax(closed_gain))
+
+    fig, ax = plt.subplots(figsize=(10.8, 5.8))
+
+    ax.plot(ws, open_gain, linewidth=2.0, label="open loop")
+    ax.plot(ws, closed_gain, linewidth=2.0, label=r"optimized controller, physical $q\to q$ gain")
+
+    ax.scatter(
+        [ws[j_open]],
+        [open_gain[j_open]],
+        marker="o",
+        s=70,
+        zorder=5,
+        label=fr"open-loop sampled peak: {open_gain[j_open]:.3e}",
+    )
+
+    ax.scatter(
+        [ws[j_closed]],
+        [closed_gain[j_closed]],
+        marker="*",
+        s=140,
+        zorder=6,
+        label=fr"closed-loop sampled peak: {closed_gain[j_closed]:.3e}",
+    )
+
+    ax.axvline(
+        float(best["omega_star"]),
+        linestyle="--",
+        linewidth=1.2,
+        label=fr"reported $\omega_\star={float(best['omega_star']):.3g}$",
+    )
+
+    ax.axhline(
+        float(best["hinf"]),
+        linestyle=":",
+        linewidth=1.5,
+        label=fr"reported $H_\infty={float(best['hinf']):.3e}$",
+    )
+
+    ax.set_xscale("symlog", linthresh=linthresh)
+    ax.set_yscale("log")
+    ax.set_xlabel(r"frequency $\omega$")
+    ax.set_ylabel(r"physical gain $\|G_{\rm cl}(i\omega)\|$")
+    ax.set_title(r"Correct comparison: open loop vs optimized dynamic controller")
+    ax.grid(True, which="both", linestyle="--", alpha=0.35)
+    ax.legend(loc="best", fontsize=8)
+
+    text = (
+        fr"$x_a={best['xa']:.3f}$, $x_s={best['xs']:.3f}$" "\n"
+        fr"reported $H_\infty={best['hinf']:.3e}$, "
+        fr"$\alpha={best['alpha']:.3e}$"
+    )
+    ax.text(
+        0.02,
+        0.04,
+        text,
+        transform=ax.transAxes,
+        fontsize=9,
+        va="bottom",
+        ha="left",
+        bbox=dict(boxstyle="round,pad=0.35", alpha=0.12),
+    )
+
+    fig.tight_layout()
+    return _manual_savefig(fig, outdir, basename)
+
+
+def make_manual_controller_all_plots(
+    outdir="/stck/eclement/Control Of NavierStokes/plots",
+):
+    paths = {}
+
+    # 1) Direct open-loop vs closed-loop frequency response.
+    paths["open_vs_controlled_gain"] = plot_manual_open_vs_controlled_gain_corrected(
+        outdir=outdir,
+        wmin=float(os.environ.get("MANUAL_GAIN_WMIN", "1e-3")),
+        wmax=float(os.environ.get("MANUAL_GAIN_WMAX", "5e1")),
+        npos=int(os.environ.get("MANUAL_GAIN_NPOS", "90")),
+    )
+
+    # 2) Noise response with vertical controller switch-on line.
+    # This function is from the previous block. It will now use the pasted controller
+    # because load_best_noK_controller(...) was overridden above.
+    if "plot_noise_switch_controller_response" in globals():
+        _, paths["noise_switch_response"] = plot_noise_switch_controller_response(
+            outdir=outdir,
+            basename="22_manual_noise_switch_controller_response",
+            t_final=float(os.environ.get("SWITCH_TFINAL", "80.0")),
+            t_on=float(os.environ.get("SWITCH_TON", "30.0")),
+            dt=float(os.environ.get("SWITCH_DT", "0.02")),
+            noise_amp=float(os.environ.get("SWITCH_NOISE_AMP", "1.0")),
+            noise_smooth_time=float(os.environ.get("SWITCH_NOISE_SMOOTH", "0.20")),
+            rms_window_time=float(os.environ.get("SWITCH_RMS_WINDOW", "2.0")),
+            seed=int(os.environ.get("SWITCH_SEED", "3")),
+        )
+    else:
+        paths["noise_switch_response"] = None
+        if _manual_is_root():
+            print("Missing plot_noise_switch_controller_response(...). Paste the previous switch-response block first.")
+
+    # 3) Flattening plot.
+    # Since you only pasted the final controller, this will show the visual
+    # continuation from open-loop to this controller, not true PyGRANSO iterations.
+    if "plot_controller_gain_curve_flattening" in globals():
+        _, paths["gain_curve_flattening"] = plot_controller_gain_curve_flattening(
+            outdir=outdir,
+            basename="23_manual_gain_curve_flattening",
+            wmin=float(os.environ.get("FLAT_WMIN", "1e-3")),
+            wmax=float(os.environ.get("FLAT_WMAX", "5e1")),
+            npos=int(os.environ.get("FLAT_NPOS", "70")),
+            ncurves=int(os.environ.get("FLAT_NCURVES", "6")),
+            use_actual_history_if_available=False,
+        )
+    else:
+        paths["gain_curve_flattening"] = None
+        if _manual_is_root():
+            print("Missing plot_controller_gain_curve_flattening(...). Paste the previous flattening block first.")
+
+    if _manual_is_root():
+        print("\nManual-controller plots written to:", outdir, flush=True)
+        for k, v in paths.items():
+            print(" ", k, "->", v, flush=True)
+
+    return paths
+
+
+if _manual_env_flag("MAKE_MANUAL_CONTROLLER_ALL_PLOTS", False):
+    manual_controller_plot_paths = make_manual_controller_all_plots(
+        outdir="/stck/eclement/Control Of NavierStokes/plots",
+    )
+
+# =============================================================================
+# CLEAN FINAL PATCH:
+#   1) implicit switch-on simulation for stiff dynamic controller
+#   2) frequency plots restricted to omega in [-0.7, -0.3]
+#
+# Paste this BELOW the previous manual-controller plotting block.
+# =============================================================================
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from petsc4py import PETSc
+
+
+# -----------------------------------------------------------------------------
+# Small helpers
+# -----------------------------------------------------------------------------
+
+def _final_is_root():
+    return ("IS_WORLD_ROOT" not in globals()) or bool(IS_WORLD_ROOT)
+
+
+def _final_barrier():
+    if "WORLD" in globals():
+        WORLD.Barrier()
+
+
+def _final_mkdir(outdir):
+    if _final_is_root():
+        os.makedirs(outdir, exist_ok=True)
+    _final_barrier()
+
+
+def _final_savefig(fig, outdir, basename):
+    _final_mkdir(outdir)
+    if not _final_is_root():
+        return None
+
+    png = os.path.join(outdir, f"{basename}.png")
+    pdf = os.path.join(outdir, f"{basename}.pdf")
+
+    fig.savefig(png, dpi=250, bbox_inches="tight")
+    fig.savefig(pdf, bbox_inches="tight")
+    plt.close(fig)
+
+    return {"png": png, "pdf": pdf}
+
+
+def _final_env_flag(name, default=False):
+    if "_env_flag" in globals():
+        return _env_flag(name, default)
+    val = os.environ.get(name)
+    if val is None:
+        return bool(default)
+    return str(val).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _final_make_lu_ksp(S):
+    if "_extra_make_lu_ksp" in globals():
+        return _extra_make_lu_ksp(S)
+    if "make_lu_ksp" in globals():
+        return make_lu_ksp(S)
+
+    ksp = PETSc.KSP().create(S.comm)
+    ksp.setOperators(S)
+    ksp.setType("preonly")
+    pc = ksp.getPC()
+    pc.setType("lu")
+    pc.setFactorShift(shift_type=PETSc.Mat.FactorShiftType.NONZERO, amount=1e-12)
+    ksp.setUp()
+    ksp.setErrorIfNotConverged(True)
+    return ksp
+
+
+def final_zoom_frequency_grid(wleft=-0.7, wright=-0.3, npos=200):
+    return np.linspace(float(wleft), float(wright), int(npos))
+
+
+# -----------------------------------------------------------------------------
+# Manual controller data: exact pasted law
+# -----------------------------------------------------------------------------
+
+MANUAL_DYNAMIC_CONTROLLER = {
+    "xa": -1.2534377484,
+    "xs": +1.1747285945,
+    "K": +1.6624761149e-23,
+    "omega_star": -4.953815e-01,
+    "hinf": 7.5271409543e+01,
+    "alpha": -2.3636495538e-01,
+
+    "a": np.array([
+        -546.80526825 + 2514.16891543j,
+        4408.26797897 + 8994.22589582j,
+        15603.0622968 + 1095.36054549j,
+        2147.09583755 - 698.34854914j,
+    ], dtype=np.complex128),
+
+    "n": np.array([
+        -47012.90839624 + 30316.9848265j,
+        -214398.86653607 + 65805.23848916j,
+        -127140.38200229 - 78081.94762484j,
+        -46568.22443389 + 6344.07992002j,
+    ], dtype=np.complex128),
+}
+
+
+def load_best_noK_controller(txt_name=None, r=4):
+    """
+    Override loader: always use the manually pasted dynamic-placement controller.
+    """
+    best = dict(MANUAL_DYNAMIC_CONTROLLER)
+    best["a"] = np.asarray(best["a"], dtype=np.complex128).reshape(r)
+    best["n"] = np.asarray(best["n"], dtype=np.complex128).reshape(r)
+    return best
+
+
+def make_manual_cldyn(r=4):
+    best = load_best_noK_controller(r=r)
+    return make_cldyn_for_placement(
+        xa=float(best["xa"]),
+        xs=float(best["xs"]),
+        A=A,
+        M=M,
+        V=V,
+        phi=phi,
+        bc=bc,
+        is_free=is_free,
+        sigma_gauss=sigma_gauss,
+        r=r,
+    )
+
+
+def manual_theta(best=None, r=4):
+    if best is None:
+        best = load_best_noK_controller(r=r)
+
+    cl_dyn = make_manual_cldyn(r=r)
+
+    theta = cl_dyn.pack_theta(
+        np.asarray(best["a"], dtype=np.complex128).reshape(r),
+        np.asarray(best["n"], dtype=np.complex128).reshape(r),
+        Kstat=float(best["K"]),
+    )
+
+    return cl_dyn, theta
+
+
+# -----------------------------------------------------------------------------
+# Correct physical gain curves
+# -----------------------------------------------------------------------------
+
+def final_open_loop_gain_curve(ws):
+    vals = []
+    for w in ws:
+        vals.append(float(gain_of_omega(A, M, float(w))))
+    return np.asarray(vals, dtype=float)
+
+
+def final_dynamic_physical_gain_curve(cl_dyn, theta, ws):
+    """
+    Correct objective for dynamic controller:
+    physical q -> q gain, same quantity used by the optimizer.
+
+    Do NOT use gain_of_omega(Acl, Ecl, omega) here.
+    That would measure the augmented plant+controller resolvent.
+    """
+    vals = []
+    for w in ws:
+        vals.append(float(cl_dyn.gain_of_omega(theta, float(w))))
+    return np.asarray(vals, dtype=float)
+
+
+def _gain_curve_for_theta(cl_dyn, theta, ws):
+    """
+    Override previous flattening helper with the correct physical gain.
+    """
+    return final_dynamic_physical_gain_curve(cl_dyn, theta, ws)
+
+
+def plot_manual_open_vs_controlled_gain_corrected(
+    outdir="/stck/eclement/Control Of NavierStokes/plots",
+    basename="21_manual_open_vs_controlled_gain_corrected",
+    wleft=-0.7,
+    wright=-0.3,
+    npos=200,
+):
+    best = load_best_noK_controller(r=4)
+    cl_dyn, theta = manual_theta(best, r=4)
+
+    ws = final_zoom_frequency_grid(wleft=wleft, wright=wright, npos=npos)
+
+    open_gain = final_open_loop_gain_curve(ws)
+    closed_gain = final_dynamic_physical_gain_curve(cl_dyn, theta, ws)
+
+    _final_mkdir(outdir)
+    if not _final_is_root():
+        return None
+
+    j_open = int(np.nanargmax(open_gain))
+    j_closed = int(np.nanargmax(closed_gain))
+
+    fig, ax = plt.subplots(figsize=(10.8, 5.8))
+
+    ax.plot(ws, open_gain, linewidth=2.0, label="open loop")
+    ax.plot(
+        ws,
+        closed_gain,
+        linewidth=2.0,
+        label=r"optimized dynamic controller",
+    )
+
+    ax.scatter(
+        [ws[j_open]],
+        [open_gain[j_open]],
+        marker="o",
+        s=70,
+        zorder=5,
+        label=fr"open sampled peak: {open_gain[j_open]:.3e}",
+    )
+
+    ax.scatter(
+        [ws[j_closed]],
+        [closed_gain[j_closed]],
+        marker="*",
+        s=140,
+        zorder=6,
+        label=fr"controlled sampled peak: {closed_gain[j_closed]:.3e}",
+    )
+
+    ax.axvline(
+        float(best["omega_star"]),
+        linestyle="--",
+        linewidth=1.3,
+        label=fr"reported $\omega_\star={float(best['omega_star']):.4g}$",
+    )
+
+    ax.axhline(
+        float(best["hinf"]),
+        linestyle=":",
+        linewidth=1.5,
+        label=fr"reported $H_\infty={float(best['hinf']):.3e}$",
+    )
+
+    ax.set_xlim(float(wleft), float(wright))
+    ax.set_yscale("log")
+    ax.set_xlabel(r"frequency $\omega$")
+    ax.set_ylabel(r"physical gain $\|G_{\rm cl}(i\omega)\|$")
+    ax.set_title(r"Zoom near the active peak: open loop vs optimized controller")
+    ax.grid(True, which="both", linestyle="--", alpha=0.35)
+    ax.legend(loc="best", fontsize=8)
+
+    text = (
+        fr"$x_a={best['xa']:.3f}$, $x_s={best['xs']:.3f}$" "\n"
+        fr"reported $H_\infty={best['hinf']:.3e}$, "
+        fr"$\alpha={best['alpha']:.3e}$"
+    )
+    ax.text(
+        0.02,
+        0.04,
+        text,
+        transform=ax.transAxes,
+        fontsize=9,
+        va="bottom",
+        ha="left",
+        bbox=dict(boxstyle="round,pad=0.35", alpha=0.12),
+    )
+
+    fig.tight_layout()
+    return _final_savefig(fig, outdir, basename)
+
+
+# -----------------------------------------------------------------------------
+# Implicit switch-on simulation
+# -----------------------------------------------------------------------------
+
+def _copy_q_into_augmented(x_aug, q, cl_dyn):
+    sub = x_aug.getSubVector(cl_dyn.is_q)
+    q.copy(sub)
+    x_aug.restoreSubVector(cl_dyn.is_q, sub)
+
+
+def _zero_controller_part(x_aug, cl_dyn):
+    sub = x_aug.getSubVector(cl_dyn.is_x)
+    sub.set(0.0)
+    x_aug.restoreSubVector(cl_dyn.is_x, sub)
+
+
+def _augmented_q_output(x_aug, cl_dyn, c_vec):
+    sub = x_aug.getSubVector(cl_dyn.is_q)
+    y = c_vec.dot(sub)
+    x_aug.restoreSubVector(cl_dyn.is_q, sub)
+    return y
+
+
+def _make_augmented_input_vec(Ecl, cl_dyn, b_vec):
+    b_aug = Ecl.createVecRight()
+    b_aug.set(0.0)
+
+    sub = b_aug.getSubVector(cl_dyn.is_q)
+    b_vec.copy(sub)
+    b_aug.restoreSubVector(cl_dyn.is_q, sub)
+
+    return b_aug
+
+
+def simulate_noise_with_controller_switch(
+    A,
+    M,
+    best,
+    t_final=80.0,
+    t_on=30.0,
+    dt=0.005,
+    noise_amp=1.0,
+    noise_smooth_time=0.20,
+    rms_window_time=2.0,
+    seed=3,
+):
+    """
+    Stable switch-on simulation.
+
+    Before t_on:
+        M qdot = A q + b d(t)
+
+    After t_on:
+        Ecl Xdot = Acl X + Bcl d(t),  X = [q; xK]
+
+    Implicit time step:
+        (Ecl - dt Acl) X_{k+1} = Ecl X_k + dt Bcl d_k
+
+    This avoids explicit Euler blow-up for stiff controller coefficients.
+    """
+
+    best = dict(best)
+    r = len(np.asarray(best["a"]).reshape(-1))
+
+    cl_dyn = make_cldyn_for_placement(
+        xa=float(best["xa"]),
+        xs=float(best["xs"]),
+        A=A,
+        M=M,
+        V=V,
+        phi=phi,
+        bc=bc,
+        is_free=is_free,
+        sigma_gauss=sigma_gauss,
+        r=r,
+    )
+
+    theta = cl_dyn.pack_theta(
+        np.asarray(best["a"], dtype=np.complex128).reshape(r),
+        np.asarray(best["n"], dtype=np.complex128).reshape(r),
+        Kstat=float(best.get("K", 0.0)),
+    )
+
+    b_vec, c_vec = build_best_input_output_vectors(best)
+
+    nt = int(np.ceil(float(t_final) / float(dt))) + 1
+    ts = np.arange(nt, dtype=float) * float(dt)
+
+    rng = np.random.default_rng(int(seed))
+    d = rng.normal(size=nt)
+
+    smooth_n = max(1, int(round(float(noise_smooth_time) / float(dt))))
+    if smooth_n > 1:
+        d = np.convolve(d, np.ones(smooth_n) / smooth_n, mode="same")
+
+    d = float(noise_amp) * d / (np.std(d) + 1e-30)
+
+    # Open-loop implicit plant step.
+    S_open = M.copy()
+    S_open.axpy(-float(dt), A)
+    S_open.assemble()
+    ksp_open = _final_make_lu_ksp(S_open)
+
+    q = M.createVecRight()
+    q.set(0.0)
+    q_next = q.duplicate()
+    rhs_q = q.duplicate()
+
+    # Closed-loop implicit augmented step.
+    Ecl = cl_dyn.Ecl()
+    Acl = cl_dyn.Acl(theta)
+
+    S_cl = Ecl.copy()
+    S_cl.axpy(-float(dt), Acl)
+    S_cl.assemble()
+    ksp_cl = _final_make_lu_ksp(S_cl)
+
+    x_aug = Ecl.createVecRight()
+    x_aug.set(0.0)
+    x_aug_next = x_aug.duplicate()
+    rhs_aug = x_aug.duplicate()
+    b_aug = _make_augmented_input_vec(Ecl, cl_dyn, b_vec)
+
+    y_hist = np.zeros(nt, dtype=np.complex128)
+    u_hist = np.zeros(nt, dtype=np.complex128)
+    on_hist = np.zeros(nt, dtype=bool)
+
+    switched = False
+    nvec = np.asarray(best["n"], dtype=np.complex128).reshape(r)
+    K = float(best.get("K", 0.0))
+
+    for k, t in enumerate(ts):
+        if t < float(t_on):
+            y_hist[k] = c_vec.dot(q)
+            u_hist[k] = 0.0
+
+            M.mult(q, rhs_q)
+            rhs_q.axpy(float(dt) * complex(d[k]), b_vec)
+
+            ksp_open.solve(rhs_q, q_next)
+            q_next.copy(q)
+
+        else:
+            if not switched:
+                x_aug.set(0.0)
+                _copy_q_into_augmented(x_aug, q, cl_dyn)
+                _zero_controller_part(x_aug, cl_dyn)
+                switched = True
+
+            on_hist[k] = True
+            y_hist[k] = _augmented_q_output(x_aug, cl_dyn, c_vec)
+
+            # Diagnostic control effort from current controller state.
+            subx = x_aug.getSubVector(cl_dyn.is_x)
+            xK_arr = subx.getArray(readonly=True).copy()
+            x_aug.restoreSubVector(cl_dyn.is_x, subx)
+            u_hist[k] = np.vdot(nvec, xK_arr) + K * y_hist[k]
+
+            Ecl.mult(x_aug, rhs_aug)
+            rhs_aug.axpy(float(dt) * complex(d[k]), b_aug)
+
+            ksp_cl.solve(rhs_aug, x_aug_next)
+            x_aug_next.copy(x_aug)
+
+    win = max(1, int(round(float(rms_window_time) / float(dt))))
+
+    return {
+        "t": ts,
+        "d": d,
+        "y": y_hist,
+        "u": u_hist,
+        "y_abs": np.abs(y_hist),
+        "y_rms": moving_rms(np.abs(y_hist), win),
+        "u_abs": np.abs(u_hist),
+        "on": on_hist,
+        "t_on": float(t_on),
+        "dt": float(dt),
+        "best": best,
+    }
+
+
+def plot_noise_switch_controller_response(
+    outdir="/stck/eclement/Control Of NavierStokes/plots",
+    basename="22_manual_noise_switch_controller_response",
+    t_final=80.0,
+    t_on=30.0,
+    dt=0.005,
+    noise_amp=1.0,
+    noise_smooth_time=0.20,
+    rms_window_time=2.0,
+    seed=3,
+):
+    best = load_best_noK_controller(r=4)
+
+    sim = simulate_noise_with_controller_switch(
+        A,
+        M,
+        best,
+        t_final=t_final,
+        t_on=t_on,
+        dt=dt,
+        noise_amp=noise_amp,
+        noise_smooth_time=noise_smooth_time,
+        rms_window_time=rms_window_time,
+        seed=seed,
+    )
+
+    _final_mkdir(outdir)
+    if not _final_is_root():
+        return sim, None
+
+    t = sim["t"]
+    d = sim["d"]
+    y_abs = sim["y_abs"]
+    y_rms = sim["y_rms"]
+    u_abs = sim["u_abs"]
+
+    pre = (t > 0.25 * t_on) & (t < t_on)
+    post = t > (t_on + 0.25 * (t_final - t_on))
+
+    pre_rms = float(np.nanmean(y_rms[pre])) if np.any(pre) else np.nan
+    post_rms = float(np.nanmean(y_rms[post])) if np.any(post) else np.nan
+
+    fig = plt.figure(figsize=(11.0, 8.4))
+    gs = fig.add_gridspec(4, 1, height_ratios=[0.95, 1.0, 1.35, 1.0])
+
+    ax_eq = fig.add_subplot(gs[0])
+    ax_d = fig.add_subplot(gs[1])
+    ax_y = fig.add_subplot(gs[2], sharex=ax_d)
+    ax_u = fig.add_subplot(gs[3], sharex=ax_d)
+
+    ax_eq.axis("off")
+    eq_text = (
+        r"$M\dot q=Aq+b\,d(t)$ before switch-on" "\n"
+        r"$E_{\rm cl}\dot X=A_{\rm cl}X+B_{\rm cl}d(t)$ after switch-on, "
+        r"$X=[q,x_K]^T$" "\n"
+        r"$y(t)=c^Hq(t),\qquad u(t)=n^Hx_K(t)+Ky(t)$"
+    )
+
+    ax_eq.text(
+        0.02,
+        0.50,
+        eq_text,
+        transform=ax_eq.transAxes,
+        va="center",
+        ha="left",
+        fontsize=14,
+        bbox=dict(boxstyle="round,pad=0.45", alpha=0.10),
+    )
+
+    ax_d.plot(t, d, linewidth=0.9)
+    ax_d.axvline(t_on, linestyle="--", linewidth=1.5,
+                 label=r"controller on at $t_{\rm on}$")
+    ax_d.set_ylabel(r"noise $d(t)$")
+    ax_d.set_title("Disturbance injected in the input channel")
+    ax_d.grid(True, linestyle="--", alpha=0.35)
+    ax_d.legend(loc="best", fontsize=9)
+
+    ax_y.plot(t, y_abs, linewidth=0.75, alpha=0.45,
+              label=r"instantaneous $|y(t)|$")
+    ax_y.plot(
+        t,
+        y_rms,
+        linewidth=2.0,
+        label=fr"moving RMS, before={pre_rms:.3e}, after={post_rms:.3e}",
+    )
+    ax_y.axvline(t_on, linestyle="--", linewidth=1.5)
+    ax_y.set_yscale("log")
+    ax_y.set_ylabel(r"measured response")
+    ax_y.set_title("Open loop first, optimized controller after switch-on")
+    ax_y.grid(True, which="both", linestyle="--", alpha=0.35)
+    ax_y.legend(loc="best", fontsize=9)
+
+    ax_u.plot(t, u_abs, linewidth=1.2)
+    ax_u.axvline(t_on, linestyle="--", linewidth=1.5)
+    ax_u.set_xlabel("time")
+    ax_u.set_ylabel(r"$|u(t)|$")
+    ax_u.set_title("Control effort after switch-on")
+    ax_u.grid(True, linestyle="--", alpha=0.35)
+
+    fig.suptitle(
+        r"Time-domain disturbance response with controller switch-on",
+        y=0.995,
+    )
+    fig.tight_layout()
+
+    paths = _final_savefig(fig, outdir, basename)
+    return sim, paths
+
+
+# -----------------------------------------------------------------------------
+# Flattening plot, zoomed to [-0.7, -0.3]
+# -----------------------------------------------------------------------------
+
+def plot_controller_gain_curve_flattening(
+    outdir="/stck/eclement/Control Of NavierStokes/plots",
+    basename="23_manual_gain_curve_flattening",
+    wleft=-0.7,
+    wright=-0.3,
+    npos=200,
+    ncurves=6,
+    use_actual_history_if_available=False,
+):
+    """
+    Since only the final pasted controller is available, this plots a visual
+    continuation from open loop to the optimized controller:
+
+        a(s) = a_open + s(a_best-a_open)
+        n(s) = 0      + s(n_best-0)
+
+    This is a presentation visual, not true PyGRANSO iteration history.
+    """
+
+    best = load_best_noK_controller(r=4)
+    cl_dyn = make_manual_cldyn(r=4)
+
+    ws = final_zoom_frequency_grid(wleft=wleft, wright=wright, npos=npos)
+
+    a_best = np.asarray(best["a"], dtype=np.complex128).reshape(4)
+    n_best = np.asarray(best["n"], dtype=np.complex128).reshape(4)
+
+    a_open = np.asarray(default_stable_a_center(4), dtype=np.complex128).reshape(4)
+    n_open = np.zeros(4, dtype=np.complex128)
+
+    ss = np.linspace(0.0, 1.0, int(ncurves))
+    curves = []
+
+    for s in ss:
+        a_s = a_open + s * (a_best - a_open)
+        n_s = n_open + s * (n_best - n_open)
+
+        theta_s = cl_dyn.pack_theta(
+            a_s,
+            n_s,
+            Kstat=float(best.get("K", 0.0)),
+        )
+
+        vals = final_dynamic_physical_gain_curve(cl_dyn, theta_s, ws)
+
+        curves.append({
+            "s": float(s),
+            "label": fr"$s={s:.2f}$",
+            "vals": vals,
+        })
+
+    _final_mkdir(outdir)
+    if not _final_is_root():
+        return {"mode": "open-loop to final-controller continuation", "curves": curves}, None
+
+    fig, ax = plt.subplots(figsize=(10.8, 5.9))
+
+    for j, c in enumerate(curves):
+        vals = c["vals"]
+        lw = 1.0 + 1.3 * j / max(1, len(curves) - 1)
+        alpha = 0.45 + 0.50 * j / max(1, len(curves) - 1)
+
+        ax.plot(ws, vals, linewidth=lw, alpha=alpha, label=c["label"])
+
+        kmax = int(np.nanargmax(vals))
+        ax.scatter([ws[kmax]], [vals[kmax]], s=35, zorder=5)
+
+    ax.axvline(
+        float(best["omega_star"]),
+        linestyle="--",
+        linewidth=1.3,
+        label=fr"reported $\omega_\star={float(best['omega_star']):.4g}$",
+    )
+
+    ax.axhline(
+        float(best["hinf"]),
+        linestyle=":",
+        linewidth=1.5,
+        label=fr"reported final $H_\infty={float(best['hinf']):.3e}$",
+    )
+
+    ax.set_xlim(float(wleft), float(wright))
+    ax.set_yscale("log")
+    ax.set_xlabel(r"frequency $\omega$")
+    ax.set_ylabel(r"physical closed-loop gain $\|G_{\rm cl}(i\omega)\|$")
+    ax.set_title(r"Gain curve flattening on the path to the optimized controller")
+    ax.grid(True, which="both", linestyle="--", alpha=0.35)
+    ax.legend(loc="best", fontsize=8)
+
+    fig.suptitle(
+        r"Zoomed frequency window: $-0.7 \leq \omega \leq -0.3$",
+        y=0.995,
+    )
+    fig.tight_layout()
+
+    paths = _final_savefig(fig, outdir, basename)
+    return {"mode": "open-loop to final-controller continuation", "curves": curves}, paths
+
+
+# -----------------------------------------------------------------------------
+# One clean wrapper
+# -----------------------------------------------------------------------------
+
+def make_manual_controller_all_plots(
+    outdir="/stck/eclement/Control Of NavierStokes/plots",
+):
+    wleft = float(os.environ.get("MANUAL_GAIN_WLEFT", "-0.7"))
+    wright = float(os.environ.get("MANUAL_GAIN_WRIGHT", "-0.3"))
+    npos = int(os.environ.get("MANUAL_GAIN_NPOS", "200"))
+
+    paths = {}
+
+    paths["open_vs_controlled_gain"] = plot_manual_open_vs_controlled_gain_corrected(
+        outdir=outdir,
+        basename="21_manual_open_vs_controlled_gain_corrected",
+        wleft=wleft,
+        wright=wright,
+        npos=npos,
+    )
+
+    _, paths["noise_switch_response"] = plot_noise_switch_controller_response(
+        outdir=outdir,
+        basename="22_manual_noise_switch_controller_response",
+        t_final=float(os.environ.get("SWITCH_TFINAL", "80.0")),
+        t_on=float(os.environ.get("SWITCH_TON", "30.0")),
+        dt=float(os.environ.get("SWITCH_DT", "0.005")),
+        noise_amp=float(os.environ.get("SWITCH_NOISE_AMP", "1.0")),
+        noise_smooth_time=float(os.environ.get("SWITCH_NOISE_SMOOTH", "0.20")),
+        rms_window_time=float(os.environ.get("SWITCH_RMS_WINDOW", "2.0")),
+        seed=int(os.environ.get("SWITCH_SEED", "3")),
+    )
+
+    _, paths["gain_curve_flattening"] = plot_controller_gain_curve_flattening(
+        outdir=outdir,
+        basename="23_manual_gain_curve_flattening",
+        wleft=float(os.environ.get("FLAT_WLEFT", str(wleft))),
+        wright=float(os.environ.get("FLAT_WRIGHT", str(wright))),
+        npos=int(os.environ.get("FLAT_NPOS", str(npos))),
+        ncurves=int(os.environ.get("FLAT_NCURVES", "6")),
+        use_actual_history_if_available=False,
+    )
+
+    if _final_is_root():
+        print("\nManual-controller plots written to:", outdir, flush=True)
+        for key, value in paths.items():
+            print(" ", key, "->", value, flush=True)
+
+    return paths
+
+
+if _final_env_flag("MAKE_MANUAL_CONTROLLER_ALL_PLOTS", False):
+    manual_controller_plot_paths = make_manual_controller_all_plots(
+        outdir="/stck/eclement/Control Of NavierStokes/plots",
+    )
